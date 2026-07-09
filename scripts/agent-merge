@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""agent-merge — Serialized merge with file locking. One agent merges at a time."""
+
+import argparse
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+QUEUE_DIR = Path.home() / ".agent-queue"
+MERGE_TIMEOUT = 300  # 5 minutes
+
+
+def merge_lock_path() -> Path:
+    """Global merge lock — one merge at a time across all projects."""
+    QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    return QUEUE_DIR / "merge.lock"
+
+
+def merge_history_path() -> Path:
+    QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    return QUEUE_DIR / "merge_history.json"
+
+
+def load_history() -> list[dict]:
+    f = merge_history_path()
+    if not f.exists():
+        return []
+    return json.loads(f.read_text())
+
+
+def save_history(entries: list[dict]):
+    # Keep last 50 entries
+    merge_history_path().write_text(json.dumps(entries[-50:], indent=2) + "\n")
+
+
+def git(*args, cwd=None) -> subprocess.CompletedProcess:
+    return subprocess.run(["git"] + list(args), cwd=cwd,
+                           capture_output=True, text=True)
+
+
+def detect_default_branch(cwd=None) -> str:
+    result = git("remote", "show", "origin", cwd=cwd)
+    for line in result.stdout.splitlines():
+        if "HEAD branch" in line:
+            return line.split(":")[-1].strip()
+    return "main"
+
+
+def cmd_merge(args):
+    branch = args.branch
+    cwd = os.getcwd()
+    do_rebase = not args.no_rebase
+    delete_branch = args.delete_branch
+
+    lock_file = merge_lock_path()
+    lock_file.touch()
+
+    with open(lock_file, "r+") as lf:
+        # Non-blocking try first to report contention
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(json.dumps({"status": "waiting", "message": "Another merge in progress, waiting..."}),
+                  file=sys.stderr)
+            # Block with timeout
+            start = time.time()
+            while True:
+                try:
+                    fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.time() - start > MERGE_TIMEOUT:
+                        print(json.dumps({"status": "timeout",
+                                          "message": f"Merge lock held for >{MERGE_TIMEOUT}s"}))
+                        sys.exit(1)
+                    time.sleep(1)
+
+        try:
+            default_branch = detect_default_branch(cwd)
+
+            # Fetch latest
+            r = git("fetch", "origin", cwd=cwd)
+            if r.returncode != 0:
+                print(json.dumps({"status": "error", "step": "fetch", "stderr": r.stderr}))
+                sys.exit(1)
+
+            if do_rebase:
+                # Rebase onto latest default branch
+                r = git("rebase", f"origin/{default_branch}", cwd=cwd)
+                if r.returncode != 0:
+                    git("rebase", "--abort", cwd=cwd)
+                    print(json.dumps({"status": "conflict", "step": "rebase",
+                                      "message": "Rebase conflict, aborted", "stderr": r.stderr}))
+                    sys.exit(1)
+
+            # Switch to default branch and merge
+            git("checkout", default_branch, cwd=cwd)
+            git("pull", "--ff-only", "origin", default_branch, cwd=cwd)
+
+            if do_rebase:
+                r = git("merge", "--ff-only", branch, cwd=cwd)
+            else:
+                r = git("merge", "--no-ff", branch, "-m", f"Merge branch '{branch}'", cwd=cwd)
+
+            if r.returncode != 0:
+                print(json.dumps({"status": "error", "step": "merge", "stderr": r.stderr}))
+                sys.exit(1)
+
+            # Push
+            r = git("push", "origin", default_branch, cwd=cwd)
+            if r.returncode != 0:
+                print(json.dumps({"status": "error", "step": "push", "stderr": r.stderr}))
+                sys.exit(1)
+
+            # Delete branch if requested
+            if delete_branch:
+                git("branch", "-d", branch, cwd=cwd)
+
+            # Record history
+            history = load_history()
+            history.append({
+                "branch": branch,
+                "default_branch": default_branch,
+                "merged_at": datetime.now(timezone.utc).isoformat(),
+                "rebase": do_rebase,
+            })
+            save_history(history)
+
+            print(json.dumps({"status": "merged", "branch": branch,
+                               "into": default_branch, "rebase": do_rebase}))
+
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def cmd_status(args):
+    lock_file = merge_lock_path()
+    locked = False
+    if lock_file.exists():
+        with open(lock_file, "r+") as lf:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lf, fcntl.LOCK_UN)
+            except BlockingIOError:
+                locked = True
+
+    history = load_history()
+    recent = history[-5:] if history else []
+
+    print(json.dumps({
+        "locked": locked,
+        "recent_merges": recent,
+    }, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Serialized merge with file locking")
+    sub = parser.add_subparsers(dest="command")
+
+    p_merge = sub.add_parser("merge")
+    p_merge.add_argument("branch")
+    p_merge.add_argument("--delete-branch", action="store_true")
+    p_merge.add_argument("--no-rebase", action="store_true")
+
+    sub.add_parser("status")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        # Legacy: agent-merge <branch> (positional)
+        if len(sys.argv) > 1 and sys.argv[1] != "status":
+            sys.argv.insert(1, "merge")
+            args = parser.parse_args()
+        else:
+            parser.print_help()
+            sys.exit(1)
+
+    if args.command == "merge":
+        cmd_merge(args)
+    elif args.command == "status":
+        cmd_status(args)
+
+
+if __name__ == "__main__":
+    main()

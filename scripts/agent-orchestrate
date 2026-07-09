@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""agent-orchestrate — Orchestrator loop for agent queue monitoring and rebalancing."""
+
+import argparse
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+QUEUE_DIR = Path.home() / ".agent-queue"
+AQ = Path(__file__).parent / "agent-queue"
+
+
+def run_aq(*args) -> dict | list | None:
+    result = subprocess.run([sys.executable, str(AQ)] + list(args),
+                             capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def orchestrate_once(project: str, dry_run: bool = False):
+    """Run one orchestration pass."""
+    plan = run_aq("-p", project, "plan")
+    if not plan:
+        print(json.dumps({"status": "no_data", "project": project}))
+        return
+
+    actions = []
+
+    # Release stale claims (in-progress with no recent activity)
+    items = run_aq("-p", project, "list", "--status", "in-progress", "--json")
+    if items:
+        for item in items:
+            # Could check heartbeat here — for now just report
+            pass
+
+    # Re-queue failed items that might succeed on retry
+    failed = run_aq("-p", project, "list", "--status", "failed", "--json")
+    if failed:
+        retryable = [f for f in failed if "conflict" in (f.get("reason") or "").lower()]
+        for item in retryable:
+            if not dry_run:
+                run_aq("-p", project, "release", str(item["id"]))
+            actions.append({"action": "retry", "id": item["id"], "title": item["title"]})
+
+    result = {
+        "project": project,
+        "plan": plan,
+        "actions": actions,
+        "dry_run": dry_run,
+    }
+    print(json.dumps(result, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Orchestrator loop")
+    parser.add_argument("-p", "--project", required=True)
+    parser.add_argument("--once", action="store_true", help="Run once and exit")
+    parser.add_argument("--interval", type=int, default=30, help="Loop interval in seconds")
+    parser.add_argument("--dry-run", action="store_true", help="Preview actions without executing")
+    args = parser.parse_args()
+
+    if args.once:
+        orchestrate_once(args.project, dry_run=args.dry_run)
+    else:
+        print(f"Orchestrating {args.project} every {args.interval}s (ctrl-c to stop)",
+              file=sys.stderr)
+        while True:
+            orchestrate_once(args.project, dry_run=args.dry_run)
+            time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+"""agent-queue — Multi-agent work queue with tag-based coordination and dependency ordering."""
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+QUEUE_DIR = Path.home() / ".agent-queue"
+
+
+def queue_dir(project: str) -> Path:
+    d = QUEUE_DIR / project
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def queue_file(project: str) -> Path:
+    return queue_dir(project) / "queue.json"
+
+
+def lock_path(project: str) -> Path:
+    return queue_dir(project) / "queue.lock"
+
+
+def load_queue(project: str) -> list[dict]:
+    f = queue_file(project)
+    if not f.exists():
+        return []
+    return json.loads(f.read_text())
+
+
+def save_queue(project: str, items: list[dict]):
+    queue_file(project).write_text(json.dumps(items, indent=2) + "\n")
+
+
+def with_lock(project: str, fn):
+    """Execute fn while holding the queue lock."""
+    lp = lock_path(project)
+    lp.touch()
+    with open(lp, "r+") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            return fn()
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def next_id(items: list[dict]) -> int:
+    if not items:
+        return 1
+    return max(i["id"] for i in items) + 1
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def make_item(id: int, title: str, description: str = "",
+              tags: list[str] | None = None, source_file: str | None = None,
+              source_line: int | None = None,
+              depends_on: list[int] | None = None) -> dict:
+    return {
+        "id": id,
+        "title": title,
+        "description": description,
+        "tags": tags or [],
+        "status": "pending",
+        "priority": "normal",
+        "agent": None,
+        "assigned_to": None,
+        "depends_on": depends_on or [],
+        "branch": None,
+        "reason": None,
+        "source_file": source_file,
+        "source_line": source_line,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "completed_at": None,
+    }
+
+
+def find_item(items: list[dict], item_id: int) -> dict | None:
+    for i in items:
+        if i["id"] == item_id:
+            return i
+    return None
+
+
+# --- Subcommands ---
+
+def cmd_init(args):
+    project = args.project
+    d = queue_dir(project)
+    f = queue_file(project)
+    if not f.exists():
+        save_queue(project, [])
+    print(json.dumps({"project": project, "queue_dir": str(d)}))
+
+
+def cmd_add(args):
+    project = args.project
+
+    def do_add():
+        items = load_queue(project)
+        depends_on = []
+        if args.depends_on:
+            depends_on = [int(x.strip()) for x in args.depends_on.split(",")]
+        item = make_item(
+            id=next_id(items),
+            title=args.title,
+            description=args.description or "",
+            tags=[t.strip() for t in args.tags.split(",")] if args.tags else [],
+            depends_on=depends_on,
+        )
+        items.append(item)
+        save_queue(project, items)
+        return item
+
+    item = with_lock(project, do_add)
+    print(json.dumps(item))
+
+
+def cmd_add_file(args):
+    project = args.project
+    filepath = Path(args.file).resolve()
+    if not filepath.exists():
+        print(f"Error: file not found: {filepath}", file=sys.stderr)
+        sys.exit(1)
+
+    lines = filepath.read_text().splitlines()
+    current_tags = []
+    added = []
+
+    def do_add_file():
+        nonlocal current_tags, added
+        items = load_queue(project)
+
+        for line_num, line in enumerate(lines, 1):
+            stripped = line.strip()
+
+            # Header → tag
+            header_match = re.match(r"^#+\s+(.+)", stripped)
+            if header_match:
+                tag = header_match.group(1).strip().lower().replace(" ", "-")
+                current_tags = [tag]
+                continue
+
+            # Checklist item
+            task_match = re.match(r"^-\s+\[\s*\]\s+(.+)", stripped)
+            if not task_match:
+                continue
+
+            text = task_match.group(1)
+
+            # Extract inline #tags
+            inline_tags = re.findall(r"#(\w[\w-]*)", text)
+            title = re.sub(r"\s*#\w[\w-]*", "", text).strip()
+
+            # Extract description after -- or em-dash
+            description = ""
+            for sep in [" -- ", " — "]:
+                if sep in title:
+                    title, description = title.split(sep, 1)
+                    break
+
+            # Extract depends_on: [N] references
+            dep_matches = re.findall(r"\[(\d+)\]", title)
+            depends_on = [int(d) for d in dep_matches]
+            title = re.sub(r"\s*\[\d+\]", "", title).strip()
+
+            tags = list(set(current_tags + inline_tags))
+            item = make_item(
+                id=next_id(items),
+                title=title,
+                description=description,
+                tags=tags,
+                source_file=str(filepath),
+                source_line=line_num,
+                depends_on=depends_on,
+            )
+            items.append(item)
+            added.append(item)
+
+        save_queue(project, items)
+        return added
+
+    result = with_lock(project, do_add_file)
+    print(json.dumps(result))
+
+
+def cmd_claim(args):
+    project = args.project
+    agent_id = args.agent
+
+    def do_claim():
+        items = load_queue(project)
+
+        # Get completed IDs for dependency checks
+        completed_ids = {i["id"] for i in items if i["status"] == "completed"}
+
+        # Active tags by other agents
+        other_active_tags = set()
+        for i in items:
+            if i["status"] == "in-progress" and i["agent"] != agent_id:
+                other_active_tags.update(i.get("tags", []))
+
+        # This agent's completed tags (affinity)
+        my_completed_tags = set()
+        for i in items:
+            if i["status"] == "completed" and i.get("agent") == agent_id:
+                my_completed_tags.update(i.get("tags", []))
+
+        # Filter claimable items
+        claimable = []
+        for i in items:
+            if i["status"] != "pending":
+                continue
+            # Check dependencies
+            deps = i.get("depends_on", [])
+            if deps and not all(d in completed_ids for d in deps):
+                continue
+            claimable.append(i)
+
+        if not claimable:
+            print(json.dumps({"error": "no_items", "message": "Queue empty or all items blocked"}))
+            sys.exit(1)
+
+        # Sort by claim priority
+        priority_order = {"high": 0, "normal": 1, "low": 2}
+
+        def score(item):
+            assigned = 1 if item.get("assigned_to") == agent_id else 0
+            prio = priority_order.get(item.get("priority", "normal"), 1)
+            overlap = len(set(item.get("tags", [])) & other_active_tags)
+            affinity = len(set(item.get("tags", [])) & my_completed_tags)
+            # Lower is better: assigned first, then high priority, then non-overlapping, then affinity
+            return (-assigned, prio, overlap, -affinity, item["id"])
+
+        claimable.sort(key=score)
+        chosen = claimable[0]
+        chosen["status"] = "in-progress"
+        chosen["agent"] = agent_id
+        chosen["updated_at"] = now_iso()
+        save_queue(project, items)
+        return chosen
+
+    item = with_lock(project, do_claim)
+    print(json.dumps(item))
+
+
+def cmd_yield_item(args):
+    project = args.project
+    agent_id = args.agent
+    item_id = int(args.id)
+
+    def do_yield():
+        items = load_queue(project)
+        item = find_item(items, item_id)
+        if not item:
+            print(json.dumps({"error": "not_found"}), file=sys.stderr)
+            sys.exit(1)
+        item["status"] = "pending"
+        item["agent"] = None
+        item["updated_at"] = now_iso()
+        save_queue(project, items)
+
+    with_lock(project, do_yield)
+
+    # Now claim next (reuses claim logic)
+    args_copy = argparse.Namespace(project=project, agent=agent_id)
+    cmd_claim(args_copy)
+
+
+def cmd_complete(args):
+    project = args.project
+    item_id = int(args.id)
+
+    def do_complete():
+        items = load_queue(project)
+        item = find_item(items, item_id)
+        if not item:
+            print(json.dumps({"error": "not_found"}), file=sys.stderr)
+            sys.exit(1)
+        item["status"] = "completed"
+        if args.branch:
+            item["branch"] = args.branch
+        item["completed_at"] = now_iso()
+        item["updated_at"] = now_iso()
+        save_queue(project, items)
+
+        # Update source file if present
+        if item.get("source_file") and item.get("source_line"):
+            _update_source(item, clean=args.clean)
+
+        return item
+
+    item = with_lock(project, do_complete)
+    print(json.dumps(item))
+
+
+def _update_source(item: dict, clean: bool = False):
+    """Check off or remove the item in its source markdown file."""
+    src = Path(item["source_file"])
+    if not src.exists():
+        return
+    lines = src.read_text().splitlines()
+    idx = item["source_line"] - 1
+    if idx < 0 or idx >= len(lines):
+        return
+    if clean:
+        lines.pop(idx)
+    else:
+        lines[idx] = re.sub(r"\[\s*\]", "[x]", lines[idx])
+    src.write_text("\n".join(lines) + "\n")
+
+
+def cmd_fail(args):
+    project = args.project
+    item_id = int(args.id)
+
+    def do_fail():
+        items = load_queue(project)
+        item = find_item(items, item_id)
+        if not item:
+            print(json.dumps({"error": "not_found"}), file=sys.stderr)
+            sys.exit(1)
+        item["status"] = "failed"
+        item["reason"] = args.reason or "unknown"
+        item["updated_at"] = now_iso()
+        save_queue(project, items)
+        return item
+
+    item = with_lock(project, do_fail)
+    print(json.dumps(item))
+
+
+def cmd_release(args):
+    project = args.project
+    item_id = int(args.id)
+
+    def do_release():
+        items = load_queue(project)
+        item = find_item(items, item_id)
+        if not item:
+            print(json.dumps({"error": "not_found"}), file=sys.stderr)
+            sys.exit(1)
+        item["status"] = "pending"
+        item["agent"] = None
+        item["updated_at"] = now_iso()
+        save_queue(project, items)
+        return item
+
+    item = with_lock(project, do_release)
+    print(json.dumps(item))
+
+
+def cmd_status(args):
+    project = args.project
+    items = load_queue(project)
+    counts = {}
+    for i in items:
+        s = i["status"]
+        counts[s] = counts.get(s, 0) + 1
+    result = {
+        "project": project,
+        "total": len(items),
+        "counts": counts,
+        "agents": list({i["agent"] for i in items if i["agent"]}),
+    }
+    print(json.dumps(result))
+
+
+def cmd_list(args):
+    project = args.project
+    items = load_queue(project)
+    if args.status:
+        items = [i for i in items if i["status"] == args.status]
+    if args.tag:
+        items = [i for i in items if args.tag in i.get("tags", [])]
+    if args.json_output:
+        print(json.dumps(items))
+    else:
+        for i in items:
+            marker = {"pending": " ", "in-progress": ">", "completed": "x",
+                       "failed": "!", "held": "-"}.get(i["status"], "?")
+            agent = f" [{i['agent']}]" if i["agent"] else ""
+            tags = f" ({', '.join(i['tags'])})" if i["tags"] else ""
+            deps = f" depends:[{','.join(str(d) for d in i['depends_on'])}]" if i.get("depends_on") else ""
+            print(f"  [{marker}] #{i['id']}{agent} {i['title']}{tags}{deps}")
+
+
+def cmd_clone(args):
+    url = args.url
+    session_id = args.session_id
+    parent = Path(args.parent) if args.parent else Path("/tmp")
+
+    # Extract repo name from URL
+    name = url.rstrip("/").split("/")[-1].removesuffix(".git")
+    clone_dir = parent / f"{name}-{session_id}"
+    branch = f"{name}-{session_id}"
+
+    if clone_dir.exists():
+        # Already cloned — just return info
+        print(json.dumps({"clone_dir": str(clone_dir), "branch": branch, "existed": True}))
+        return
+
+    subprocess.run(["git", "clone", url, str(clone_dir)], check=True,
+                    capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(clone_dir), "checkout", "-b", branch],
+                    check=True, capture_output=True, text=True)
+
+    print(json.dumps({"clone_dir": str(clone_dir), "branch": branch, "existed": False}))
+
+
+def cmd_sync(args):
+    work_dir = args.dir or os.getcwd()
+    try:
+        subprocess.run(["git", "-C", work_dir, "fetch", "origin"],
+                        check=True, capture_output=True, text=True)
+        # Determine default branch
+        result = subprocess.run(
+            ["git", "-C", work_dir, "remote", "show", "origin"],
+            capture_output=True, text=True
+        )
+        default_branch = "main"
+        for line in result.stdout.splitlines():
+            if "HEAD branch" in line:
+                default_branch = line.split(":")[-1].strip()
+                break
+
+        subprocess.run(
+            ["git", "-C", work_dir, "rebase", f"origin/{default_branch}"],
+            check=True, capture_output=True, text=True
+        )
+        print(json.dumps({"status": "synced", "branch": default_branch}))
+    except subprocess.CalledProcessError:
+        subprocess.run(["git", "-C", work_dir, "rebase", "--abort"],
+                        capture_output=True, text=True)
+        print(json.dumps({"status": "conflict", "message": "Rebase aborted, will resolve at merge"}))
+
+
+# --- Orchestrator subcommands ---
+
+def cmd_assign(args):
+    project = args.project
+    item_id = int(args.id)
+    agent_id = args.agent_id
+
+    def do_assign():
+        items = load_queue(project)
+        item = find_item(items, item_id)
+        if not item:
+            print(json.dumps({"error": "not_found"}), file=sys.stderr)
+            sys.exit(1)
+        item["assigned_to"] = agent_id
+        item["updated_at"] = now_iso()
+        save_queue(project, items)
+        return item
+
+    item = with_lock(project, do_assign)
+    print(json.dumps(item))
+
+
+def cmd_unassign(args):
+    project = args.project
+    item_id = int(args.id)
+
+    def do_unassign():
+        items = load_queue(project)
+        item = find_item(items, item_id)
+        if not item:
+            print(json.dumps({"error": "not_found"}), file=sys.stderr)
+            sys.exit(1)
+        item["assigned_to"] = None
+        item["updated_at"] = now_iso()
+        save_queue(project, items)
+        return item
+
+    item = with_lock(project, do_unassign)
+    print(json.dumps(item))
+
+
+def cmd_priority(args):
+    project = args.project
+    item_id = int(args.id)
+    level = args.level
+
+    def do_priority():
+        items = load_queue(project)
+        item = find_item(items, item_id)
+        if not item:
+            print(json.dumps({"error": "not_found"}), file=sys.stderr)
+            sys.exit(1)
+        item["priority"] = level
+        item["updated_at"] = now_iso()
+        save_queue(project, items)
+        return item
+
+    item = with_lock(project, do_priority)
+    print(json.dumps(item))
+
+
+def cmd_hold(args):
+    project = args.project
+    item_id = int(args.id)
+
+    def do_hold():
+        items = load_queue(project)
+        item = find_item(items, item_id)
+        if not item:
+            print(json.dumps({"error": "not_found"}), file=sys.stderr)
+            sys.exit(1)
+        item["status"] = "held"
+        item["updated_at"] = now_iso()
+        save_queue(project, items)
+        return item
+
+    item = with_lock(project, do_hold)
+    print(json.dumps(item))
+
+
+def cmd_unhold(args):
+    project = args.project
+    item_id = int(args.id)
+
+    def do_unhold():
+        items = load_queue(project)
+        item = find_item(items, item_id)
+        if not item:
+            print(json.dumps({"error": "not_found"}), file=sys.stderr)
+            sys.exit(1)
+        item["status"] = "pending"
+        item["updated_at"] = now_iso()
+        save_queue(project, items)
+        return item
+
+    item = with_lock(project, do_unhold)
+    print(json.dumps(item))
+
+
+def cmd_reorder(args):
+    project = args.project
+    item_id = int(args.id)
+
+    def do_reorder():
+        items = load_queue(project)
+        item = find_item(items, item_id)
+        if not item:
+            print(json.dumps({"error": "not_found"}), file=sys.stderr)
+            sys.exit(1)
+        items.remove(item)
+        if args.before:
+            target = find_item(items, int(args.before))
+            if target:
+                idx = items.index(target)
+                items.insert(idx, item)
+            else:
+                items.append(item)
+        elif args.after:
+            target = find_item(items, int(args.after))
+            if target:
+                idx = items.index(target) + 1
+                items.insert(idx, item)
+            else:
+                items.append(item)
+        save_queue(project, items)
+        return item
+
+    item = with_lock(project, do_reorder)
+    print(json.dumps(item))
+
+
+def cmd_plan(args):
+    project = args.project
+    items = load_queue(project)
+
+    pending = [i for i in items if i["status"] == "pending"]
+    in_progress = [i for i in items if i["status"] == "in-progress"]
+    completed_ids = {i["id"] for i in items if i["status"] == "completed"}
+
+    # Compute dependency levels (topological)
+    levels = {}
+    for item in pending:
+        deps = item.get("depends_on", [])
+        unmet = [d for d in deps if d not in completed_ids]
+        if not unmet:
+            levels.setdefault(0, []).append(item)
+        else:
+            # Find max level of deps among pending items
+            levels.setdefault(1, []).append(item)  # simplified: blocked = level 1
+
+    # Tag clusters
+    tag_groups = {}
+    for item in pending + in_progress:
+        for tag in item.get("tags", []):
+            tag_groups.setdefault(tag, []).append(item["id"])
+
+    # Active agents
+    agents = {}
+    for item in in_progress:
+        if item["agent"]:
+            agents.setdefault(item["agent"], []).append(item["id"])
+
+    result = {
+        "project": project,
+        "pending": len(pending),
+        "in_progress": len(in_progress),
+        "completed": len([i for i in items if i["status"] == "completed"]),
+        "failed": len([i for i in items if i["status"] == "failed"]),
+        "held": len([i for i in items if i["status"] == "held"]),
+        "ready": len(levels.get(0, [])),
+        "blocked": len(levels.get(1, [])),
+        "tag_clusters": {k: v for k, v in tag_groups.items()},
+        "active_agents": agents,
+    }
+    print(json.dumps(result, indent=2))
+
+
+# --- Argument parsing ---
+
+def add_project_arg(parser):
+    parser.add_argument("-p", "--project", default=None,
+                        help="Project name (defaults to current dir name)")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Multi-agent work queue")
+    sub = parser.add_subparsers(dest="command")
+
+    # init
+    p_init = sub.add_parser("init")
+    add_project_arg(p_init)
+
+    # add
+    p_add = sub.add_parser("add")
+    add_project_arg(p_add)
+    p_add.add_argument("title")
+    p_add.add_argument("description", nargs="?", default="")
+    p_add.add_argument("--tags", default="")
+    p_add.add_argument("--depends-on", dest="depends_on", default="")
+
+    # add-file
+    p_af = sub.add_parser("add-file")
+    add_project_arg(p_af)
+    p_af.add_argument("file")
+
+    # claim
+    p_claim = sub.add_parser("claim")
+    add_project_arg(p_claim)
+    p_claim.add_argument("--agent", required=True)
+
+    # yield
+    p_yield = sub.add_parser("yield")
+    add_project_arg(p_yield)
+    p_yield.add_argument("id")
+    p_yield.add_argument("--agent", required=True)
+
+    # complete
+    p_complete = sub.add_parser("complete")
+    add_project_arg(p_complete)
+    p_complete.add_argument("id")
+    p_complete.add_argument("--branch", default=None)
+    p_complete.add_argument("--clean", action="store_true")
+
+    # fail
+    p_fail = sub.add_parser("fail")
+    add_project_arg(p_fail)
+    p_fail.add_argument("id")
+    p_fail.add_argument("--reason", default="")
+
+    # release
+    p_release = sub.add_parser("release")
+    add_project_arg(p_release)
+    p_release.add_argument("id")
+
+    # status
+    p_status = sub.add_parser("status")
+    add_project_arg(p_status)
+
+    # list
+    p_list = sub.add_parser("list")
+    add_project_arg(p_list)
+    p_list.add_argument("--status", default=None)
+    p_list.add_argument("--tag", default=None)
+    p_list.add_argument("--json", dest="json_output", action="store_true")
+
+    # clone
+    p_clone = sub.add_parser("clone")
+    p_clone.add_argument("url")
+    p_clone.add_argument("session_id")
+    p_clone.add_argument("--parent", default=None)
+
+    # sync
+    p_sync = sub.add_parser("sync")
+    p_sync.add_argument("--dir", default=None)
+
+    # plan
+    p_plan = sub.add_parser("plan")
+    add_project_arg(p_plan)
+
+    # assign
+    p_assign = sub.add_parser("assign")
+    add_project_arg(p_assign)
+    p_assign.add_argument("id")
+    p_assign.add_argument("agent_id")
+
+    # unassign
+    p_unassign = sub.add_parser("unassign")
+    add_project_arg(p_unassign)
+    p_unassign.add_argument("id")
+
+    # priority
+    p_prio = sub.add_parser("priority")
+    add_project_arg(p_prio)
+    p_prio.add_argument("id")
+    p_prio.add_argument("level", choices=["high", "normal", "low"])
+
+    # hold
+    p_hold = sub.add_parser("hold")
+    add_project_arg(p_hold)
+    p_hold.add_argument("id")
+
+    # unhold
+    p_unhold = sub.add_parser("unhold")
+    add_project_arg(p_unhold)
+    p_unhold.add_argument("id")
+
+    # reorder
+    p_reorder = sub.add_parser("reorder")
+    add_project_arg(p_reorder)
+    p_reorder.add_argument("id")
+    p_reorder.add_argument("--before", default=None)
+    p_reorder.add_argument("--after", default=None)
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    if not hasattr(args, "project") or not args.project:
+        args.project = Path.cwd().name
+
+    cmds = {
+        "init": cmd_init, "add": cmd_add, "add-file": cmd_add_file,
+        "claim": cmd_claim, "yield": cmd_yield_item, "complete": cmd_complete,
+        "fail": cmd_fail, "release": cmd_release, "status": cmd_status,
+        "list": cmd_list, "clone": cmd_clone, "sync": cmd_sync,
+        "plan": cmd_plan, "assign": cmd_assign, "unassign": cmd_unassign,
+        "priority": cmd_priority, "hold": cmd_hold, "unhold": cmd_unhold,
+        "reorder": cmd_reorder,
+    }
+    cmds[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
