@@ -14,8 +14,7 @@ from unittest import mock
 # ---------------------------------------------------------------------------
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "agent-queue"
 _loader = importlib.machinery.SourceFileLoader("agent_queue", str(_SCRIPT))
-_spec = importlib.util.spec_from_loader("agent_queue", _loader,
-                                         origin=str(_SCRIPT))
+_spec = importlib.util.spec_from_loader("agent_queue", _loader, origin=str(_SCRIPT))
 aq = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(aq)
 
@@ -24,8 +23,17 @@ _spec.loader.exec_module(aq)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _item(id: int, *, status="pending", priority="normal", tags=None,
-          agent=None, title=None, depends_on=None):
+
+def _item(
+    id: int,
+    *,
+    status="pending",
+    priority="normal",
+    tags=None,
+    agent=None,
+    title=None,
+    depends_on=None,
+):
     """Build a minimal queue item dict for testing."""
     return {
         "id": id,
@@ -58,9 +66,10 @@ def _run_list(items, *, status=None, tag=None, json_output=False) -> str:
         args.tag = tag
         args.json_output = json_output
 
-        with mock.patch("builtins.print",
-                        side_effect=lambda *a, **k: lines.append(
-                            " ".join(str(x) for x in a))):
+        with mock.patch(
+            "builtins.print",
+            side_effect=lambda *a, **k: lines.append(" ".join(str(x) for x in a)),
+        ):
             aq.cmd_list(args)
 
     return "\n".join(lines)
@@ -69,6 +78,7 @@ def _run_list(items, *, status=None, tag=None, json_output=False) -> str:
 # ---------------------------------------------------------------------------
 # Tests — --json output
 # ---------------------------------------------------------------------------
+
 
 class TestJsonOutput:
     def test_json_flag_emits_valid_json_array(self):
@@ -79,8 +89,7 @@ class TestJsonOutput:
         assert [i["id"] for i in parsed] == [1, 2]
 
     def test_json_preserves_all_item_fields(self):
-        items = [_item(1, tags=["backend"], agent="agent-1",
-                        status="in-progress")]
+        items = [_item(1, tags=["backend"], agent="agent-1", status="in-progress")]
         parsed = json.loads(_run_list(items, json_output=True))
         assert parsed[0]["tags"] == ["backend"]
         assert parsed[0]["agent"] == "agent-1"
@@ -97,8 +106,7 @@ class TestJsonOutput:
 
     def test_json_respects_status_filter(self):
         items = [_item(1, status="pending"), _item(2, status="completed")]
-        parsed = json.loads(_run_list(items, status="completed",
-                                      json_output=True))
+        parsed = json.loads(_run_list(items, status="completed", json_output=True))
         assert [i["id"] for i in parsed] == [2]
 
     def test_json_respects_tag_filter(self):
@@ -110,6 +118,7 @@ class TestJsonOutput:
 # ---------------------------------------------------------------------------
 # Tests — default table output (unchanged by --json)
 # ---------------------------------------------------------------------------
+
 
 class TestTableOutput:
     def test_default_output_is_not_json(self):

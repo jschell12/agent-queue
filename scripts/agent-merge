@@ -8,7 +8,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 QUEUE_DIR = Path.home() / ".agent-queue"
@@ -39,8 +39,7 @@ def save_history(entries: list[dict]):
 
 
 def git(*args, cwd=None) -> subprocess.CompletedProcess:
-    return subprocess.run(["git"] + list(args), cwd=cwd,
-                           capture_output=True, text=True)
+    return subprocess.run(["git"] + list(args), cwd=cwd, capture_output=True, text=True)
 
 
 def detect_default_branch(cwd=None) -> str:
@@ -65,8 +64,15 @@ def cmd_merge(args):
         try:
             fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            print(json.dumps({"status": "waiting", "message": "Another merge in progress, waiting..."}),
-                  file=sys.stderr)
+            print(
+                json.dumps(
+                    {
+                        "status": "waiting",
+                        "message": "Another merge in progress, waiting...",
+                    }
+                ),
+                file=sys.stderr,
+            )
             # Block with timeout
             start = time.time()
             while True:
@@ -75,8 +81,14 @@ def cmd_merge(args):
                     break
                 except BlockingIOError:
                     if time.time() - start > MERGE_TIMEOUT:
-                        print(json.dumps({"status": "timeout",
-                                          "message": f"Merge lock held for >{MERGE_TIMEOUT}s"}))
+                        print(
+                            json.dumps(
+                                {
+                                    "status": "timeout",
+                                    "message": f"Merge lock held for >{MERGE_TIMEOUT}s",
+                                }
+                            )
+                        )
                         sys.exit(1)
                     time.sleep(1)
 
@@ -86,7 +98,9 @@ def cmd_merge(args):
             # Fetch latest
             r = git("fetch", "origin", cwd=cwd)
             if r.returncode != 0:
-                print(json.dumps({"status": "error", "step": "fetch", "stderr": r.stderr}))
+                print(
+                    json.dumps({"status": "error", "step": "fetch", "stderr": r.stderr})
+                )
                 sys.exit(1)
 
             if do_rebase:
@@ -94,8 +108,16 @@ def cmd_merge(args):
                 r = git("rebase", f"origin/{default_branch}", cwd=cwd)
                 if r.returncode != 0:
                     git("rebase", "--abort", cwd=cwd)
-                    print(json.dumps({"status": "conflict", "step": "rebase",
-                                      "message": "Rebase conflict, aborted", "stderr": r.stderr}))
+                    print(
+                        json.dumps(
+                            {
+                                "status": "conflict",
+                                "step": "rebase",
+                                "message": "Rebase conflict, aborted",
+                                "stderr": r.stderr,
+                            }
+                        )
+                    )
                     sys.exit(1)
 
             # Switch to default branch and merge
@@ -105,16 +127,27 @@ def cmd_merge(args):
             if do_rebase:
                 r = git("merge", "--ff-only", branch, cwd=cwd)
             else:
-                r = git("merge", "--no-ff", branch, "-m", f"Merge branch '{branch}'", cwd=cwd)
+                r = git(
+                    "merge",
+                    "--no-ff",
+                    branch,
+                    "-m",
+                    f"Merge branch '{branch}'",
+                    cwd=cwd,
+                )
 
             if r.returncode != 0:
-                print(json.dumps({"status": "error", "step": "merge", "stderr": r.stderr}))
+                print(
+                    json.dumps({"status": "error", "step": "merge", "stderr": r.stderr})
+                )
                 sys.exit(1)
 
             # Push
             r = git("push", "origin", default_branch, cwd=cwd)
             if r.returncode != 0:
-                print(json.dumps({"status": "error", "step": "push", "stderr": r.stderr}))
+                print(
+                    json.dumps({"status": "error", "step": "push", "stderr": r.stderr})
+                )
                 sys.exit(1)
 
             # Delete branch if requested
@@ -123,16 +156,26 @@ def cmd_merge(args):
 
             # Record history
             history = load_history()
-            history.append({
-                "branch": branch,
-                "default_branch": default_branch,
-                "merged_at": datetime.now(timezone.utc).isoformat(),
-                "rebase": do_rebase,
-            })
+            history.append(
+                {
+                    "branch": branch,
+                    "default_branch": default_branch,
+                    "merged_at": datetime.now(UTC).isoformat(),
+                    "rebase": do_rebase,
+                }
+            )
             save_history(history)
 
-            print(json.dumps({"status": "merged", "branch": branch,
-                               "into": default_branch, "rebase": do_rebase}))
+            print(
+                json.dumps(
+                    {
+                        "status": "merged",
+                        "branch": branch,
+                        "into": default_branch,
+                        "rebase": do_rebase,
+                    }
+                )
+            )
 
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
@@ -152,10 +195,15 @@ def cmd_status(args):
     history = load_history()
     recent = history[-5:] if history else []
 
-    print(json.dumps({
-        "locked": locked,
-        "recent_merges": recent,
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "locked": locked,
+                "recent_merges": recent,
+            },
+            indent=2,
+        )
+    )
 
 
 def main():
