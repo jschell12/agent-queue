@@ -12,8 +12,6 @@ item an agent should claim next.  Priority factors (from highest to lowest):
 
 import importlib.util
 import json
-import sys
-import textwrap
 from pathlib import Path
 from unittest import mock
 
@@ -24,8 +22,7 @@ import pytest
 # ---------------------------------------------------------------------------
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "agent-queue"
 _loader = importlib.machinery.SourceFileLoader("agent_queue", str(_SCRIPT))
-_spec = importlib.util.spec_from_loader("agent_queue", _loader,
-                                         origin=str(_SCRIPT))
+_spec = importlib.util.spec_from_loader("agent_queue", _loader, origin=str(_SCRIPT))
 aq = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(aq)
 
@@ -34,8 +31,17 @@ _spec.loader.exec_module(aq)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _item(id: int, *, status="pending", priority="normal", tags=None,
-          agent=None, assigned_to=None, depends_on=None):
+
+def _item(
+    id: int,
+    *,
+    status="pending",
+    priority="normal",
+    tags=None,
+    agent=None,
+    assigned_to=None,
+    depends_on=None,
+):
     """Build a minimal queue item dict for testing."""
     return {
         "id": id,
@@ -67,9 +73,11 @@ def _run_claim(items: list[dict], agent_id: str = "agent-1") -> dict:
     def fake_save(_project, saved_items):
         captured["items"] = saved_items
 
-    with mock.patch.object(aq, "load_queue", return_value=items), \
-         mock.patch.object(aq, "save_queue", side_effect=fake_save), \
-         mock.patch.object(aq, "with_lock", side_effect=lambda _p, fn: fn()):
+    with (
+        mock.patch.object(aq, "load_queue", return_value=items),
+        mock.patch.object(aq, "save_queue", side_effect=fake_save),
+        mock.patch.object(aq, "with_lock", side_effect=lambda _p, fn: fn()),
+    ):
         args = mock.MagicMock()
         args.project = "test"
         args.agent = agent_id
@@ -84,6 +92,7 @@ def _run_claim(items: list[dict], agent_id: str = "agent-1") -> dict:
 # ---------------------------------------------------------------------------
 # Tests — basic claim
 # ---------------------------------------------------------------------------
+
 
 class TestClaimBasic:
     def test_claims_only_pending_item(self):
@@ -116,6 +125,7 @@ class TestClaimBasic:
 # ---------------------------------------------------------------------------
 # Tests — priority ordering
 # ---------------------------------------------------------------------------
+
 
 class TestPriorityOrdering:
     def test_high_before_normal(self):
@@ -156,6 +166,7 @@ class TestPriorityOrdering:
 # Tests — assigned_to takes precedence over priority
 # ---------------------------------------------------------------------------
 
+
 class TestAssignment:
     def test_assigned_item_beats_higher_priority(self):
         items = [
@@ -188,12 +199,13 @@ class TestAssignment:
 # Tests — tag overlap avoidance
 # ---------------------------------------------------------------------------
 
+
 class TestTagOverlap:
     def test_avoids_tags_used_by_other_agents(self):
         items = [
             _item(1, tags=["frontend"], status="in-progress", agent="agent-2"),
             _item(2, tags=["frontend"]),  # overlaps with agent-2
-            _item(3, tags=["backend"]),   # no overlap
+            _item(3, tags=["backend"]),  # no overlap
         ]
         result = _run_claim(items, agent_id="agent-1")
         assert result["id"] == 3
@@ -201,9 +213,9 @@ class TestTagOverlap:
     def test_overlap_with_multiple_tags(self):
         items = [
             _item(1, tags=["api", "auth"], status="in-progress", agent="agent-2"),
-            _item(2, tags=["api"]),          # 1 tag overlap
+            _item(2, tags=["api"]),  # 1 tag overlap
             _item(3, tags=["api", "auth"]),  # 2 tag overlap
-            _item(4, tags=["docs"]),         # 0 tag overlap
+            _item(4, tags=["docs"]),  # 0 tag overlap
         ]
         result = _run_claim(items, agent_id="agent-1")
         assert result["id"] == 4
@@ -212,7 +224,7 @@ class TestTagOverlap:
         """An agent's own in-progress items should not penalize its next claim."""
         items = [
             _item(1, tags=["backend"], status="in-progress", agent="agent-1"),
-            _item(2, tags=["backend"]),   # same tag as agent-1's own work
+            _item(2, tags=["backend"]),  # same tag as agent-1's own work
             _item(3, tags=["frontend"]),
         ]
         result = _run_claim(items, agent_id="agent-1")
@@ -225,7 +237,7 @@ class TestTagOverlap:
         items = [
             _item(1, tags=["frontend"], status="in-progress", agent="agent-2"),
             _item(2, tags=["frontend"], priority="high"),  # overlaps but high prio
-            _item(3, tags=["backend"], priority="low"),    # no overlap but low prio
+            _item(3, tags=["backend"], priority="low"),  # no overlap but low prio
         ]
         result = _run_claim(items, agent_id="agent-1")
         assert result["id"] == 2
@@ -235,12 +247,13 @@ class TestTagOverlap:
 # Tests — tag affinity (prefer agent's previously completed tags)
 # ---------------------------------------------------------------------------
 
+
 class TestTagAffinity:
     def test_prefers_tags_agent_completed_before(self):
         items = [
             _item(1, tags=["frontend"], status="completed", agent="agent-1"),
-            _item(2, tags=["backend"]),    # no affinity
-            _item(3, tags=["frontend"]),   # affinity match
+            _item(2, tags=["backend"]),  # no affinity
+            _item(3, tags=["frontend"]),  # affinity match
         ]
         result = _run_claim(items, agent_id="agent-1")
         assert result["id"] == 3
@@ -250,7 +263,7 @@ class TestTagAffinity:
             _item(1, tags=["api"], status="completed", agent="agent-1"),
             _item(2, tags=["auth"], status="completed", agent="agent-1"),
             _item(3, tags=["api", "auth"]),  # 2 affinity matches
-            _item(4, tags=["api"]),           # 1 affinity match
+            _item(4, tags=["api"]),  # 1 affinity match
         ]
         result = _run_claim(items, agent_id="agent-1")
         assert result["id"] == 3
@@ -271,7 +284,7 @@ class TestTagAffinity:
             _item(1, tags=["frontend"], status="completed", agent="agent-1"),
             _item(5, tags=["frontend"], status="in-progress", agent="agent-2"),
             _item(2, tags=["frontend"]),  # affinity but overlaps with agent-2
-            _item(3, tags=["backend"]),   # no affinity, no overlap
+            _item(3, tags=["backend"]),  # no affinity, no overlap
         ]
         result = _run_claim(items, agent_id="agent-1")
         assert result["id"] == 3
@@ -281,11 +294,12 @@ class TestTagAffinity:
 # Tests — dependency checking
 # ---------------------------------------------------------------------------
 
+
 class TestDependencies:
     def test_skips_items_with_unmet_deps(self):
         items = [
             _item(1, depends_on=[99]),  # dep 99 not completed
-            _item(2),                    # no deps
+            _item(2),  # no deps
         ]
         result = _run_claim(items)
         assert result["id"] == 2
@@ -322,6 +336,7 @@ class TestDependencies:
 # Tests — combined scoring
 # ---------------------------------------------------------------------------
 
+
 class TestCombinedScoring:
     def test_full_priority_chain(self):
         """Assignment > priority > overlap > affinity > id."""
@@ -331,11 +346,11 @@ class TestCombinedScoring:
             # Agent-1 completed "backend" before
             _item(11, tags=["backend"], status="completed", agent="agent-1"),
             # Candidates:
-            _item(1, priority="normal", tags=["frontend"]),          # overlap
-            _item(2, priority="high", tags=["backend"]),             # high prio + affinity
-            _item(3, priority="normal", tags=["backend"]),           # affinity
-            _item(4, priority="normal", tags=["docs"]),              # neutral
-            _item(5, priority="normal", assigned_to="agent-1"),      # assigned
+            _item(1, priority="normal", tags=["frontend"]),  # overlap
+            _item(2, priority="high", tags=["backend"]),  # high prio + affinity
+            _item(3, priority="normal", tags=["backend"]),  # affinity
+            _item(4, priority="normal", tags=["docs"]),  # neutral
+            _item(5, priority="normal", assigned_to="agent-1"),  # assigned
         ]
         result = _run_claim(items, agent_id="agent-1")
         # assigned_to wins over everything
@@ -358,7 +373,7 @@ class TestCombinedScoring:
         items = [
             _item(10, tags=["frontend"], status="in-progress", agent="agent-2"),
             _item(1, priority="normal", tags=["frontend"]),  # 1 overlap
-            _item(2, priority="normal", tags=["backend"]),   # 0 overlap
+            _item(2, priority="normal", tags=["backend"]),  # 0 overlap
         ]
         result = _run_claim(items, agent_id="agent-1")
         assert result["id"] == 2
@@ -367,7 +382,7 @@ class TestCombinedScoring:
         items = [
             _item(10, tags=["backend"], status="completed", agent="agent-1"),
             _item(1, priority="normal", tags=["frontend"]),
-            _item(2, priority="normal", tags=["backend"]),   # affinity
+            _item(2, priority="normal", tags=["backend"]),  # affinity
         ]
         result = _run_claim(items, agent_id="agent-1")
         assert result["id"] == 2
@@ -386,11 +401,13 @@ class TestCombinedScoring:
 # Tests — score function directly
 # ---------------------------------------------------------------------------
 
+
 class TestScoreFunction:
     """Test the score tuple values directly to verify ordering semantics."""
 
-    def _compute_score(self, item, agent_id="agent-1",
-                       other_active_tags=None, my_completed_tags=None):
+    def _compute_score(
+        self, item, agent_id="agent-1", other_active_tags=None, my_completed_tags=None
+    ):
         """Reproduce the score() logic from cmd_claim."""
         if other_active_tags is None:
             other_active_tags = set()
@@ -447,16 +464,19 @@ class TestScoreFunction:
     def test_score_ordering(self):
         """Verify that score tuples sort correctly for a realistic scenario."""
         assigned_low = self._compute_score(
-            _item(5, priority="low", assigned_to="agent-1"), "agent-1")
-        high_prio = self._compute_score(
-            _item(1, priority="high"), "agent-1")
-        normal_no_overlap = self._compute_score(
-            _item(2, priority="normal"), "agent-1")
+            _item(5, priority="low", assigned_to="agent-1"), "agent-1"
+        )
+        high_prio = self._compute_score(_item(1, priority="high"), "agent-1")
+        normal_no_overlap = self._compute_score(_item(2, priority="normal"), "agent-1")
         normal_with_overlap = self._compute_score(
-            _item(3, priority="normal", tags=["x"]), "agent-1",
-            other_active_tags={"x"})
+            _item(3, priority="normal", tags=["x"]), "agent-1", other_active_tags={"x"}
+        )
 
         scores = [assigned_low, high_prio, normal_no_overlap, normal_with_overlap]
         sorted_scores = sorted(scores)
-        assert sorted_scores == [assigned_low, high_prio, normal_no_overlap,
-                                 normal_with_overlap]
+        assert sorted_scores == [
+            assigned_low,
+            high_prio,
+            normal_no_overlap,
+            normal_with_overlap,
+        ]

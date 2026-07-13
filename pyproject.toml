@@ -1,0 +1,40 @@
+[project]
+name = "agent-queue"
+version = "0.1.0"
+description = "Multi-agent work queue with tag-based coordination, merge locking, and dependency ordering."
+requires-python = ">=3.12"
+
+# ---------------------------------------------------------------------------
+# Ruff — linter + formatter
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+# The core scripts live in scripts/ without a .py extension, so ruff's default
+# "*.py" glob never sees them. Add them explicitly (plus any future *.py under
+# scripts/tests) so `ruff check` / `ruff format` discover them.
+extend-include = [
+    "scripts/agent-queue",
+    "scripts/agent-merge",
+    "scripts/agent-orchestrate",
+]
+
+[tool.ruff.lint]
+# A pragmatic default set: pyflakes (F), pycodestyle (E/W), isort (I),
+# pyupgrade (UP), flake8-bugbear (B), and comprehensions (C4).
+select = ["E", "W", "F", "I", "UP", "B", "C4"]
+ignore = [
+    "E501",  # line length is enforced by the formatter, not the linter
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
