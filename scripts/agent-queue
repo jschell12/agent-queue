@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """agent-queue — Multi-agent work queue with tag-based coordination and dependency ordering."""
+from __future__ import annotations
 
 import argparse
 import fcntl
