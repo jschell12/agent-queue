@@ -73,3 +73,47 @@ Data lives at `~/.agent-queue/<project>/queue.json`. Locking uses `fcntl.flock` 
 ## Merge Lock
 
 `agent-merge` holds a global lock during fetch → rebase → push. 5-minute timeout. Only one agent merges at a time, preventing push races.
+
+## Development
+
+Contributions welcome. The project targets **Python 3.12+** and has no runtime
+dependencies beyond the standard library; the only dev dependencies are
+[`ruff`](https://docs.astral.sh/ruff/) (lint + format) and
+[`pytest`](https://docs.pytest.org/) (tests).
+
+### Setup
+
+```bash
+# From a clean checkout, create a virtualenv and install the dev tools
+python3 -m venv .venv
+source .venv/bin/activate
+pip install ruff pytest
+```
+
+### Make targets
+
+The `Makefile` wraps the common workflows:
+
+| Command | What it does |
+|---------|--------------|
+| `make test` | Run the test suite with `pytest` |
+| `make lint` | Lint `scripts/` and `tests/` with `ruff check` |
+| `make fmt`  | Format `scripts/` and `tests/` with `ruff format` |
+
+Ruff is configured (in `pyproject.toml`) to include the extensionless scripts
+(`scripts/agent-queue`, `scripts/agent-merge`, `scripts/agent-orchestrate`) in
+its file selection, so lint and format cover them too.
+
+Run the checks before opening a PR:
+
+```bash
+make fmt    # auto-format
+make lint   # style + static checks
+make test   # run tests
+```
+
+### Continuous integration
+
+GitHub Actions runs `make lint` and `make test` on every pull request (and on
+pushes to `main`) via `.github/workflows/ci.yml`, so PRs must be lint-clean and
+green before merge.
