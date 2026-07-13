@@ -34,6 +34,24 @@ CLONE_INFO=$("$AQ/agent-queue" clone git@github.com:org/repo.git agent-1 --paren
 "$AQ/agent-queue" complete -p my-project 1 --branch my-branch
 ```
 
+## Subcommands
+
+The three core subcommands for the claim → work → complete cycle:
+
+```bash
+# add — enqueue a task (title required; description and tags optional)
+"$AQ/agent-queue" add -p my-project "Add login page" "OAuth + session cookie" --tags frontend
+
+# claim — atomically hand the next ready task to an agent (prints the item as JSON)
+"$AQ/agent-queue" claim -p my-project --agent agent-1
+
+# complete — mark a claimed task done, recording the branch that delivered it
+"$AQ/agent-queue" complete -p my-project 1 --branch my-branch
+```
+
+Run `"$AQ/agent-queue" <subcommand> --help` for the full flag list. Other subcommands
+include `init`, `add-file`, `fail`, `review`, `status`, `list`, and `clone`.
+
 ## Dependencies
 
 Tasks can declare dependencies so agents work in the right order:
