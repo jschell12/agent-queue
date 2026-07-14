@@ -586,6 +586,64 @@ def cmd_health(args):
     emit(result, 0 if status == "healthy" else 2)
 
 
+# ---------------------------------------------------------------------------
+# Terminal color support (stdlib-only; no rich/colorama)
+# ---------------------------------------------------------------------------
+ANSI_RESET = "\033[0m"
+
+# Per-status ANSI style codes for the human-readable `list` table.
+STATUS_STYLES = {
+    "pending": "\033[2m",  # dim
+    "in-progress": "\033[36m",  # cyan
+    "in-review": "\033[33m",  # yellow
+    "completed": "\033[32m",  # green
+    "failed": "\033[31m",  # red
+    "held": "\033[2m",  # dim
+}
+
+
+def use_color(no_color: bool, stream=None) -> bool:
+    """Whether ANSI color should be emitted to *stream* (default stdout).
+
+    Color is disabled when explicitly turned off (``--no-color``), when the
+    ``NO_COLOR`` env var is set (see https://no-color.org), or when the stream
+    is not an interactive TTY (e.g. piped or redirected output).
+    """
+    if no_color or os.environ.get("NO_COLOR"):
+        return False
+    stream = stream if stream is not None else sys.stdout
+    return bool(getattr(stream, "isatty", lambda: False)())
+
+
+def _format_list_row(i: dict, colored: bool) -> str:
+    """Render a single queue item as a human-readable table row.
+
+    When *colored* is true the whole row is wrapped in the status's ANSI style
+    code; otherwise a plain (escape-free) string is returned.
+    """
+    marker = {
+        "pending": " ",
+        "in-progress": ">",
+        "in-review": "r",
+        "completed": "x",
+        "failed": "!",
+        "held": "-",
+    }.get(i["status"], "?")
+    agent = f" [{i['agent']}]" if i["agent"] else ""
+    tags = f" ({', '.join(i['tags'])})" if i["tags"] else ""
+    deps = (
+        f" depends:[{','.join(str(d) for d in i['depends_on'])}]"
+        if i.get("depends_on")
+        else ""
+    )
+    row = f"  [{marker}] #{i['id']}{agent} {i['title']}{tags}{deps}"
+    if colored:
+        style = STATUS_STYLES.get(i["status"])
+        if style:
+            row = f"{style}{row}{ANSI_RESET}"
+    return row
+
+
 def cmd_list(args):
     project = args.project
     items = load_queue(project)
@@ -594,25 +652,12 @@ def cmd_list(args):
     if args.tag:
         items = [i for i in items if args.tag in i.get("tags", [])]
     if args.json_output:
+        # The machine-readable path is never colored.
         print(json.dumps(items))
     else:
+        colored = use_color(getattr(args, "no_color", False))
         for i in items:
-            marker = {
-                "pending": " ",
-                "in-progress": ">",
-                "in-review": "r",
-                "completed": "x",
-                "failed": "!",
-                "held": "-",
-            }.get(i["status"], "?")
-            agent = f" [{i['agent']}]" if i["agent"] else ""
-            tags = f" ({', '.join(i['tags'])})" if i["tags"] else ""
-            deps = (
-                f" depends:[{','.join(str(d) for d in i['depends_on'])}]"
-                if i.get("depends_on")
-                else ""
-            )
-            print(f"  [{marker}] #{i['id']}{agent} {i['title']}{tags}{deps}")
+            print(_format_list_row(i, colored))
 
 
 def cmd_clone(args):
@@ -980,6 +1025,12 @@ def main():
     p_list.add_argument("--status", default=None)
     p_list.add_argument("--tag", default=None)
     p_list.add_argument("--json", dest="json_output", action="store_true")
+    p_list.add_argument(
+        "--no-color",
+        dest="no_color",
+        action="store_true",
+        help="Disable colored output (also honored: NO_COLOR env, non-TTY stdout)",
+    )
 
     # clone
     p_clone = sub.add_parser("clone")
