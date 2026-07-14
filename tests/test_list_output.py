@@ -142,3 +142,90 @@ class TestTableOutput:
         output = _run_list([_item(3, tags=["api"], depends_on=[1, 2])])
         assert "(api)" in output
         assert "depends:[1,2]" in output
+
+    def test_non_tty_table_has_no_ansi(self):
+        """The default (mocked-print, non-TTY) path emits zero escape codes."""
+        output = _run_list([_item(1, status="failed", title="boom")])
+        assert "\033[" not in output
+
+
+# ---------------------------------------------------------------------------
+# Tests — colored output
+# ---------------------------------------------------------------------------
+
+
+class _FakeStream:
+    """Minimal stdout stand-in with a controllable isatty()."""
+
+    def __init__(self, tty: bool):
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+class TestColorGating:
+    def test_use_color_true_for_tty(self):
+        with mock.patch.dict("os.environ", clear=True):
+            assert aq.use_color(False, stream=_FakeStream(tty=True)) is True
+
+    def test_use_color_false_for_non_tty(self):
+        assert aq.use_color(False, stream=_FakeStream(tty=False)) is False
+
+    def test_use_color_false_when_no_color_flag(self):
+        assert aq.use_color(True, stream=_FakeStream(tty=True)) is False
+
+    def test_use_color_respects_no_color_env(self):
+        with mock.patch.dict("os.environ", {"NO_COLOR": "1"}):
+            assert aq.use_color(False, stream=_FakeStream(tty=True)) is False
+
+
+class TestColoredRows:
+    def test_row_colored_when_forced_on(self):
+        row = aq._format_list_row(_item(1, status="completed"), colored=True)
+        assert "\033[32m" in row  # green
+        assert row.endswith(aq.ANSI_RESET)
+
+    def test_row_uncolored_when_forced_off(self):
+        row = aq._format_list_row(_item(1, status="completed"), colored=False)
+        assert "\033[" not in row
+
+    def test_distinct_style_per_status(self):
+        statuses = [
+            "pending",
+            "in-progress",
+            "in-review",
+            "completed",
+            "failed",
+            "held",
+        ]
+        for status in statuses:
+            row = aq._format_list_row(_item(1, status=status), colored=True)
+            assert aq.STATUS_STYLES[status] in row
+
+    def test_colored_row_preserves_fields(self):
+        row = aq._format_list_row(
+            _item(
+                3,
+                status="in-progress",
+                agent="agent-1",
+                tags=["api"],
+                depends_on=[1, 2],
+            ),
+            colored=True,
+        )
+        assert "[>]" in row
+        assert "[agent-1]" in row
+        assert "(api)" in row
+        assert "depends:[1,2]" in row
+        assert "#3" in row
+
+
+class TestJsonNeverColored:
+    def test_json_output_has_no_ansi_even_when_forced(self):
+        """--json must be escape-free regardless of any color state."""
+        items = [_item(1, status="failed"), _item(2, status="completed")]
+        output = _run_list(items, json_output=True)
+        assert "\033[" not in output
+        # Still valid JSON.
+        assert [i["id"] for i in json.loads(output)] == [1, 2]
