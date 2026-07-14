@@ -49,8 +49,20 @@ The three core subcommands for the claim → work → complete cycle:
 "$AQ/agent-queue" complete -p my-project 1 --branch my-branch
 ```
 
+```bash
+# health — check queue integrity; exit 0 = healthy, non-zero = degraded/unhealthy
+"$AQ/agent-queue" health -p my-project
+"$AQ/agent-queue" health -p my-project --stale-minutes 15
+```
+
+`health` is read-only and prints a JSON report (`status`, per-check results,
+status `counts`, and a `stale_in_progress` count). It exits 0 when the queue is
+`healthy`, 2 when `degraded` (an `in-progress` item has been untouched past
+`--stale-minutes`, default 30), and 1 when `unhealthy` (queue never initialized
+or `queue.json` is corrupt), so it drops into monitoring and `&&` chains.
+
 Run `"$AQ/agent-queue" <subcommand> --help` for the full flag list. Other subcommands
-include `init`, `add-file`, `fail`, `review`, `status`, `list`, and `clone`.
+include `init`, `add-file`, `fail`, `review`, `status`, `health`, `list`, and `clone`.
 
 ## Dependencies
 
