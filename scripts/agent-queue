@@ -467,6 +467,125 @@ def cmd_status(args):
     print(json.dumps(result))
 
 
+def cmd_health(args):
+    """Inspect queue integrity and report a machine-readable health status.
+
+    Read-only: never writes or mutates queue.json. Exit code is 0 for a
+    healthy queue and non-zero otherwise (2 = degraded, 1 = unhealthy), so
+    the command can be used in monitoring and `&&` chains.
+    """
+    project = args.project
+    stale_minutes = args.stale_minutes
+    f = queue_file(project)
+
+    def emit(result: dict, code: int):
+        print(json.dumps(result, indent=2))
+        sys.exit(code)
+
+    # Check 1 — the queue must have been initialized.
+    if not f.exists():
+        emit(
+            {
+                "project": project,
+                "status": "unhealthy",
+                "reason": "not_initialized",
+                "checks": {"queue_file_exists": False},
+                "queue_file": str(f),
+                "total": 0,
+                "counts": {},
+                "stale_in_progress": 0,
+            },
+            1,
+        )
+
+    # Check 2 — the queue file must be parseable JSON.
+    try:
+        raw = f.read_text()
+        items = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as e:
+        emit(
+            {
+                "project": project,
+                "status": "unhealthy",
+                "reason": "corrupt_json",
+                "checks": {"queue_file_exists": True, "valid_json": False},
+                "queue_file": str(f),
+                "total": 0,
+                "counts": {},
+                "stale_in_progress": 0,
+                "error": str(e),
+            },
+            1,
+        )
+
+    # Check 3 — the top-level structure must be a list of items.
+    if not isinstance(items, list):
+        emit(
+            {
+                "project": project,
+                "status": "unhealthy",
+                "reason": "malformed_structure",
+                "checks": {
+                    "queue_file_exists": True,
+                    "valid_json": True,
+                    "is_list": False,
+                },
+                "queue_file": str(f),
+                "total": 0,
+                "counts": {},
+                "stale_in_progress": 0,
+            },
+            1,
+        )
+
+    checks = {"queue_file_exists": True, "valid_json": True, "is_list": True}
+
+    # Status counts.
+    counts: dict[str, int] = {}
+    for i in items:
+        s = i.get("status", "unknown")
+        counts[s] = counts.get(s, 0) + 1
+
+    # Stale-claim detection: in-progress items not touched within the threshold.
+    now = datetime.now(UTC)
+    stale_items = []
+    for i in items:
+        if i.get("status") != "in-progress":
+            continue
+        updated = i.get("updated_at")
+        if not updated:
+            continue
+        try:
+            ts = datetime.fromisoformat(updated)
+        except (ValueError, TypeError):
+            continue
+        age_minutes = (now - ts).total_seconds() / 60
+        if age_minutes > stale_minutes:
+            stale_items.append(
+                {
+                    "id": i.get("id"),
+                    "agent": i.get("agent"),
+                    "age_minutes": round(age_minutes, 1),
+                }
+            )
+
+    checks["no_stale_in_progress"] = not stale_items
+
+    status = "degraded" if stale_items else "healthy"
+    result = {
+        "project": project,
+        "status": status,
+        "checks": checks,
+        "queue_file": str(f),
+        "total": len(items),
+        "counts": counts,
+        "stale_minutes": stale_minutes,
+        "stale_in_progress": len(stale_items),
+        "stale_items": stale_items,
+    }
+    emit(result, 0 if status == "healthy" else 2)
+
+
 def cmd_list(args):
     project = args.project
     items = load_queue(project)
@@ -837,6 +956,24 @@ def main():
     p_status = sub.add_parser("status")
     add_project_arg(p_status)
 
+    # health
+    p_health = sub.add_parser("health")
+    add_project_arg(p_health)
+    p_health.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Emit JSON (default; accepted for consistency with sibling commands)",
+    )
+    p_health.add_argument(
+        "--stale-minutes",
+        dest="stale_minutes",
+        type=float,
+        default=30.0,
+        help="Flag in-progress items untouched for longer than this as stale "
+        "(default: 30)",
+    )
+
     # list
     p_list = sub.add_parser("list")
     add_project_arg(p_list)
@@ -914,6 +1051,7 @@ def main():
         "set-meta": cmd_set_meta,
         "get-meta": cmd_get_meta,
         "status": cmd_status,
+        "health": cmd_health,
         "list": cmd_list,
         "clone": cmd_clone,
         "sync": cmd_sync,
